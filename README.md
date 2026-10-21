@@ -13,6 +13,10 @@ including the exact column if possible.
 - Parses:
   - javac errors and warnings, including the column from the caret line (`^`)
   - Kotlin compiler messages (`e: file:///…:line:col message`)
+  - KSP messages (e.g. Hilt/Dagger, `e: [ksp] …`); without location the
+    first class of the "Dependency trace" is resolved to its source file;
+    the cursor jumps to the processed method (`unable to process
+    'provideFoo(…)'`) or else to the class declaration
   - Android resource XML parse errors and aapt2 errors
   - AAPT2 link errors; the internal resource name
     (`<appid>-main-42:/layout/foo.xml`) is resolved to the real file

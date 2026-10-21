@@ -73,6 +73,18 @@ function! gradlew#Setup() abort
         \ '%\a%\+ file ''%f'' line: %l',
         \ ])
 
+  " KSP (e.g. Hilt/Dagger): with location "e: [ksp] /path/File.kt:12: msg",
+  " otherwise without location; then the file is the first type element of
+  " the "Dependency trace:" (resolved in gradlew#AfterMake())
+  call extend(l:efm, [
+        \ '%t: [ksp] %f:%l: %m',
+        \ '%Ee: [ksp] %m',
+        \ '%Ww: [ksp] %m',
+        \ ])
+  for l:kind in ['CLASS', 'INTERFACE', 'OBJECT', 'ENUM', 'ANNOTATION']
+    call add(l:efm, '%C%\s%#=> element (' . l:kind . '): %f')
+  endfor
+
   " kotlin: single line with file:// URI and column
   " order matters: %Z (caret line) before the catch-all %C
   call extend(l:efm, [
@@ -94,6 +106,12 @@ function! gradlew#QfText(info) abort
   let l:lines = []
   for l:i in range(a:info.start_idx - 1, a:info.end_idx - 1)
     let l:e    = l:qf.items[l:i]
+    let l:type = l:e.type ==? 'e' ? ' error' : l:e.type ==? 'w' ? ' warning' : ''
+    let l:text = substitute(l:e.text, '\n\s*', ' ', 'g')
+    if l:e.bufnr == 0
+      call add(l:lines, '|' . l:type[1:] . '| ' . l:text)
+      continue
+    endif
     let l:name = fnamemodify(bufname(l:e.bufnr), ':p')
     if l:use_root && !empty(l:root) && stridx(l:name, l:root . '/') == 0
       let l:name = l:name[len(l:root) + 1 :]
@@ -101,8 +119,6 @@ function! gradlew#QfText(info) abort
       let l:name = fnamemodify(l:name, ':~:.')
     endif
     let l:pos  = l:e.lnum . (l:e.col > 0 ? ' col ' . l:e.col : '')
-    let l:type = l:e.type ==? 'e' ? ' error' : l:e.type ==? 'w' ? ' warning' : ''
-    let l:text = substitute(l:e.text, '\n\s*', ' ', 'g')
     call add(l:lines, l:name . '|' . l:pos . l:type . '| ' . l:text)
   endfor
   return l:lines
@@ -131,8 +147,65 @@ function! s:ResolveAaptPath(name, root) abort
   return ''
 endfunction
 
+" Return [line, col] of the first line in a:lines matching a:pat, or [0, 0]
+function! s:FindDecl(lines, pat) abort
+  let l:lnum = 0
+  for l:line in a:lines
+    let l:lnum += 1
+    let l:col = match(l:line, a:pat) + 1
+    if l:col > 0
+      return [l:lnum, l:col]
+    endif
+  endfor
+  return [0, 0]
+endfunction
+
+" KSP errors without location name a class ("com.example.Outer.Inner").
+" Search its source file below src/<sourceset>/{java,kotlin}/ and return
+" [path, line, col] of the declaration of a:member (method name from the
+" message, may be empty) or else of the class, or [] if not found.
+function! s:ResolveClass(fqcn, root, member) abort
+  if empty(a:root) || a:fqcn !~# '^\h\w*\(\.\h\w*\)\+$'
+    return []
+  endif
+  let l:parts = split(a:fqcn, '\.')
+  let l:class = l:parts[-1]
+  " nested classes: drop trailing upper case parts until a file is found
+  while len(l:parts) > 1
+    let l:rel = join(l:parts, '/')
+    for l:dir in ['/src/*/', '/*/src/*/', '/**/src/*/']
+      let l:found = filter(glob(a:root . l:dir . '{java,kotlin}/' . l:rel . '.{kt,java}', 1, 1),
+            \ 'v:val !~# "/build/"')
+      if !empty(l:found)
+        let l:lines = readfile(l:found[0])
+        let l:pos   = [0, 0]
+        if !empty(a:member) && a:member !=# l:class
+          " Kotlin "fun [<T>] [Receiver.]name", Java "<type> name(" (not a call)
+          let l:pos = s:FindDecl(l:lines, '\C\<fun\s\+\(<.\{-}>\s*\)\=\(\w\+\.\)\=\zs'
+                \ . a:member . '\>')
+          if l:pos[0] == 0 && l:found[0] =~# '\.java$'
+            let l:pos = s:FindDecl(l:lines, '\C^\s*\(return\>\)\@!\S[^=(]*\s\zs'
+                  \ . a:member . '\s*(')
+          endif
+        endif
+        if l:pos[0] == 0
+          let l:pos = s:FindDecl(l:lines,
+                \ '\C\<\(class\|interface\|object\|enum\)\s\+\zs' . l:class . '\>')
+        endif
+        return l:pos[0] > 0 ? [l:found[0]] + l:pos : [l:found[0], 1, 0]
+      endif
+    endfor
+    if l:parts[-2] !~# '^\u'
+      break
+    endif
+    call remove(l:parts, -1)
+  endwhile
+  return []
+endfunction
+
 " Post-process the quickfix list after :make in a Gradle project:
 " - resolve AAPT2 resource names to the real file in the project
+" - resolve class names of KSP errors to the source file
 " - remove duplicates (Gradle repeats compiler errors in its failure summary);
 "   entries are compared by buffer, line and text, a missing column is taken
 "   over from the duplicate
@@ -144,17 +217,36 @@ function! gradlew#AfterMake() abort
     return
   endif
   let l:root  = b:gradle_root
-  let l:items = filter(getqflist(), 'v:val.valid')
+  " keep KSP errors without location (no file name -> not valid)
+  let l:items = filter(getqflist(), 'v:val.valid || v:val.text =~# ''\S'' && v:val.type =~? ''^[ew]$''')
   let l:bogus = {}
 
   let l:located = {}
   for l:e in l:items
-    let l:name = bufname(l:e.bufnr)
+    let l:name = l:e.bufnr > 0 ? bufname(l:e.bufnr) : ''
     if l:name =~# ':/'
       let l:path = s:ResolveAaptPath(l:name, l:root)
       if !empty(l:path)
         let l:bogus[l:e.bufnr] = 1
         let l:e.bufnr = bufadd(l:path)
+      endif
+    elseif l:e.lnum == 0
+      " only KSP errors without location have no line number; the file is a
+      " class name or (no dependency trace) a previous file of the output
+      " "unable to process 'provideFoo(…)'": jump to the method
+      let l:member = matchstr(l:e.text, 'unable to process ''\zs\h\w*\ze(')
+      let l:loc = s:ResolveClass(l:name, l:root, l:member)
+      if !empty(l:loc)
+        let l:bogus[l:e.bufnr] = 1
+        let [l:path, l:e.lnum, l:e.col] = l:loc
+        let l:e.bufnr = bufadd(l:path)
+      else
+        if l:name =~# '^\h\w*\(\.\h\w*\)\+$' && !filereadable(l:name)
+          let l:bogus[l:e.bufnr] = 1
+          let l:e.text .= ' (' . l:name . ')'
+        endif
+        let l:e.bufnr = 0
+        let l:e.valid = 0
       endif
     endif
     if !empty(l:e.text)
